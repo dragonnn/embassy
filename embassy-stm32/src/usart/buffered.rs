@@ -12,8 +12,8 @@ use embassy_sync::waitqueue::AtomicWaker;
 #[cfg(not(any(usart_v1, usart_v2)))]
 use super::DePin;
 use super::{
-    clear_interrupt_flags, configure, rdr, reconfigure, send_break, sr, tdr, Config, ConfigError, CtsPin, Error, Info,
-    Instance, Regs, RtsPin, RxPin, TxPin,
+    clear_interrupt_flags, configure, rdr, reconfigure, send_break, set_baudrate, sr, tdr, Config, ConfigError, CtsPin,
+    Error, Info, Instance, Regs, RtsPin, RxPin, TxPin,
 };
 use crate::gpio::{AfType, AnyPin, OutputType, Pull, SealedPin as _, Speed};
 use crate::interrupt::{self, InterruptExt};
@@ -157,6 +157,7 @@ pub struct BufferedUartTx<'d> {
     tx: Option<PeripheralRef<'d, AnyPin>>,
     cts: Option<PeripheralRef<'d, AnyPin>>,
     de: Option<PeripheralRef<'d, AnyPin>>,
+    is_borrowed: bool,
 }
 
 /// Rx-only buffered UART
@@ -168,6 +169,7 @@ pub struct BufferedUartRx<'d> {
     kernel_clock: Hertz,
     rx: Option<PeripheralRef<'d, AnyPin>>,
     rts: Option<PeripheralRef<'d, AnyPin>>,
+    is_borrowed: bool,
 }
 
 impl<'d> SetConfig for BufferedUart<'d> {
@@ -341,6 +343,7 @@ impl<'d> BufferedUart<'d> {
                 kernel_clock,
                 rx,
                 rts,
+                is_borrowed: false,
             },
             tx: BufferedUartTx {
                 info,
@@ -349,6 +352,7 @@ impl<'d> BufferedUart<'d> {
                 tx,
                 cts,
                 de,
+                is_borrowed: false,
             },
         };
         this.enable_and_configure(tx_buffer, rx_buffer, &config)?;
@@ -396,6 +400,31 @@ impl<'d> BufferedUart<'d> {
         (self.tx, self.rx)
     }
 
+    /// Split the Uart into a transmitter and receiver,
+    /// which is particularly useful when having two tasks correlating to
+    /// transmitting and receiving.
+    pub fn split_ref(&mut self) -> (BufferedUartTx<'_>, BufferedUartRx<'_>) {
+        (
+            BufferedUartTx {
+                info: self.tx.info,
+                state: self.tx.state,
+                kernel_clock: self.tx.kernel_clock,
+                tx: self.tx.tx.as_mut().map(PeripheralRef::reborrow),
+                cts: self.tx.cts.as_mut().map(PeripheralRef::reborrow),
+                de: self.tx.de.as_mut().map(PeripheralRef::reborrow),
+                is_borrowed: true,
+            },
+            BufferedUartRx {
+                info: self.rx.info,
+                state: self.rx.state,
+                kernel_clock: self.rx.kernel_clock,
+                rx: self.rx.rx.as_mut().map(PeripheralRef::reborrow),
+                rts: self.rx.rts.as_mut().map(PeripheralRef::reborrow),
+                is_borrowed: true,
+            },
+        )
+    }
+
     /// Reconfigure the driver
     pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
         reconfigure(self.rx.info, self.rx.kernel_clock, config)?;
@@ -411,6 +440,13 @@ impl<'d> BufferedUart<'d> {
     /// Send break character
     pub fn send_break(&self) {
         self.tx.send_break()
+    }
+
+    /// Set baudrate
+    pub fn set_baudrate(&self, baudrate: u32) -> Result<(), ConfigError> {
+        self.tx.set_baudrate(baudrate)?;
+        self.rx.set_baudrate(baudrate)?;
+        Ok(())
     }
 }
 
@@ -506,6 +542,11 @@ impl<'d> BufferedUartRx<'d> {
 
         Ok(())
     }
+
+    /// Set baudrate
+    pub fn set_baudrate(&self, baudrate: u32) -> Result<(), ConfigError> {
+        set_baudrate(self.info, self.kernel_clock, baudrate)
+    }
 }
 
 impl<'d> BufferedUartTx<'d> {
@@ -596,44 +637,53 @@ impl<'d> BufferedUartTx<'d> {
     pub fn send_break(&self) {
         send_break(&self.info.regs);
     }
+
+    /// Set baudrate
+    pub fn set_baudrate(&self, baudrate: u32) -> Result<(), ConfigError> {
+        set_baudrate(self.info, self.kernel_clock, baudrate)
+    }
 }
 
 impl<'d> Drop for BufferedUartRx<'d> {
     fn drop(&mut self) {
-        let state = self.state;
-        unsafe {
-            state.rx_buf.deinit();
+        if !self.is_borrowed {
+            let state = self.state;
+            unsafe {
+                state.rx_buf.deinit();
 
-            // TX is inactive if the the buffer is not available.
-            // We can now unregister the interrupt handler
-            if state.tx_buf.len() == 0 {
-                self.info.interrupt.disable();
+                // TX is inactive if the the buffer is not available.
+                // We can now unregister the interrupt handler
+                if state.tx_buf.len() == 0 {
+                    self.info.interrupt.disable();
+                }
             }
-        }
 
-        self.rx.as_ref().map(|x| x.set_as_disconnected());
-        self.rts.as_ref().map(|x| x.set_as_disconnected());
-        drop_tx_rx(self.info, state);
+            self.rx.as_ref().map(|x| x.set_as_disconnected());
+            self.rts.as_ref().map(|x| x.set_as_disconnected());
+            drop_tx_rx(self.info, state);
+        }
     }
 }
 
 impl<'d> Drop for BufferedUartTx<'d> {
     fn drop(&mut self) {
-        let state = self.state;
-        unsafe {
-            state.tx_buf.deinit();
+        if !self.is_borrowed {
+            let state = self.state;
+            unsafe {
+                state.tx_buf.deinit();
 
-            // RX is inactive if the the buffer is not available.
-            // We can now unregister the interrupt handler
-            if state.rx_buf.len() == 0 {
-                self.info.interrupt.disable();
+                // RX is inactive if the the buffer is not available.
+                // We can now unregister the interrupt handler
+                if state.rx_buf.len() == 0 {
+                    self.info.interrupt.disable();
+                }
             }
-        }
 
-        self.tx.as_ref().map(|x| x.set_as_disconnected());
-        self.cts.as_ref().map(|x| x.set_as_disconnected());
-        self.de.as_ref().map(|x| x.set_as_disconnected());
-        drop_tx_rx(self.info, state);
+            self.tx.as_ref().map(|x| x.set_as_disconnected());
+            self.cts.as_ref().map(|x| x.set_as_disconnected());
+            self.de.as_ref().map(|x| x.set_as_disconnected());
+            drop_tx_rx(self.info, state);
+        }
     }
 }
 

@@ -75,14 +75,6 @@ foreach_interrupt! {
             DRIVER.on_interrupt()
         }
     };
-    (TIM1, timer, $block:ident, CC, $irq:ident) => {
-        #[cfg(time_driver_tim1)]
-        #[cfg(feature = "rt")]
-        #[interrupt]
-        fn $irq() {
-            DRIVER.on_interrupt()
-        }
-    };
     (TIM2, timer, $block:ident, CC, $irq:ident) => {
         #[cfg(time_driver_tim2)]
         #[cfg(feature = "rt")]
@@ -123,14 +115,6 @@ foreach_interrupt! {
             DRIVER.on_interrupt()
         }
     };
-    (TIM8, timer, $block:ident, CC, $irq:ident) => {
-        #[cfg(time_driver_tim8)]
-        #[cfg(feature = "rt")]
-        #[interrupt]
-        fn $irq() {
-            DRIVER.on_interrupt()
-        }
-    };
     (TIM9, timer, $block:ident, CC, $irq:ident) => {
         #[cfg(time_driver_tim9)]
         #[cfg(feature = "rt")]
@@ -149,14 +133,6 @@ foreach_interrupt! {
     };
     (TIM15, timer, $block:ident, CC, $irq:ident) => {
         #[cfg(time_driver_tim15)]
-        #[cfg(feature = "rt")]
-        #[interrupt]
-        fn $irq() {
-            DRIVER.on_interrupt()
-        }
-    };
-    (TIM20, timer, $block:ident, CC, $irq:ident) => {
-        #[cfg(time_driver_tim20)]
         #[cfg(feature = "rt")]
         #[interrupt]
         fn $irq() {
@@ -261,13 +237,10 @@ pub(crate) struct RtcDriver {
     rtc: Mutex<CriticalSectionRawMutex, Cell<Option<&'static Rtc>>>,
 }
 
-#[allow(clippy::declare_interior_mutable_const)]
-const ALARM_STATE_NEW: AlarmState = AlarmState::new();
-
 embassy_time_driver::time_driver_impl!(static DRIVER: RtcDriver = RtcDriver {
     period: AtomicU32::new(0),
     alarm_count: AtomicU8::new(0),
-    alarms: Mutex::const_new(CriticalSectionRawMutex::new(), [ALARM_STATE_NEW; ALARM_COUNT]),
+    alarms: Mutex::const_new(CriticalSectionRawMutex::new(), [const{AlarmState::new()}; ALARM_COUNT]),
     #[cfg(feature = "low-power")]
     rtc: Mutex::const_new(CriticalSectionRawMutex::new(), Cell::new(None)),
 });
@@ -437,11 +410,14 @@ impl RtcDriver {
         regs_gp16().cnt().write(|w| w.set_cnt(cnt as u16));
 
         // Now, recompute all alarms
-        for i in 0..ALARM_COUNT {
+        for i in 0..self.alarm_count.load(Ordering::Relaxed) as usize {
             let alarm_handle = unsafe { AlarmHandle::new(i as u8) };
             let alarm = self.get_alarm(cs, alarm_handle);
 
-            self.set_alarm(alarm_handle, alarm.timestamp.get());
+            if !self.set_alarm(alarm_handle, alarm.timestamp.get()) {
+                // If the alarm timestamp has passed, we need to trigger it
+                self.trigger_alarm(i, cs);
+            }
         }
     }
 
